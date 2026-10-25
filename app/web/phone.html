@@ -24,56 +24,126 @@
   .title { font-size:16px; font-weight:600; }
   .meta { color:var(--muted); font-size:13px; margin-top:3px; }
   #msg { margin:0 16px; color:var(--bad); font-size:14px; min-height:20px; }
+  #review { display:none; margin:12px 16px; padding:12px; background:var(--card); border-radius:14px; }
+  #review h2 { margin:0 0 6px; font-size:16px; }
+  #review img { width:100%; border-radius:8px; display:block; background:#000; }
+  #verdict { font-size:14px; margin:8px 0; }
+  #verdict.ok { color:var(--ok); }
+  #verdict.warn { color:var(--warn); }
+  .small { margin-top:8px; }
+  .small span { color:var(--muted); font-size:12px; }
+  .small img { max-height:180px; width:auto; max-width:100%; }
+  .row { display:flex; gap:10px; margin-top:12px; }
+  .row button { flex:1; padding:14px 0; font-size:17px; font-weight:600; border-radius:10px; border:1px solid var(--muted); background:var(--card); color:var(--text); }
+  .row button.primary { background:var(--primary); border-color:var(--primary); color:#fff; }
+  label.auto { display:block; margin-top:12px; font-size:14px; color:var(--muted); }
 </style>
 </head>
 <body>
 <header>
   <h1>OMR 拍照上传</h1>
-  <div class="sub">点“拍照”，用手机相机拍下整张答题卡，确认后自动上传并识别。</div>
+  <div class="sub">点“拍照”拍下整张答题卡；电脑会自动找出边框并裁剪，确认后开始识别。</div>
 </header>
 <button class="shot" id="shot">拍照</button>
 <input id="file" type="file" accept="image/*" capture="environment" hidden>
 <div id="msg"></div>
-<div class="counter" id="counter">已上传 0 张</div>
+
+<section id="review">
+  <h2>边框预览</h2>
+  <img id="outline" alt="边框预览">
+  <div id="verdict"></div>
+  <div class="small" id="cropbox"><span>裁剪后</span><img id="cropped" alt="裁剪后"></div>
+  <div class="row">
+    <button id="retake">重拍</button>
+    <button id="confirm" class="primary">确认识别</button>
+  </div>
+  <label class="auto"><input type="checkbox" id="auto"> 以后自动确认（仍会显示边框预览）</label>
+</section>
+
+<div class="counter" id="counter">已确认 0 张</div>
 <ul id="list"></ul>
 <script>
 const TOKEN = new URLSearchParams(location.search).get("t") || "";
+const Q = "t=" + encodeURIComponent(TOKEN);
 const MAX_SIDE = 3200;
 const STATUS_TEXT = { ok: "识别完成", multi: "识别完成，有多涂", error: "识别失败" };
-let uploaded = 0;
-const fileInput = document.getElementById("file");
-const shot = document.getElementById("shot");
-const list = document.getElementById("list");
-const msg = document.getElementById("msg");
+let confirmed = 0;
+let current = null;
+const $ = (id) => document.getElementById(id);
+const fileInput = $("file"), shot = $("shot"), list = $("list"), msg = $("msg"), review = $("review"), autoBox = $("auto");
+try { autoBox.checked = localStorage.getItem("omr-auto") === "1"; } catch (e) { /* 隐私模式下无法保存 */ }
+autoBox.addEventListener("change", () => { try { localStorage.setItem("omr-auto", autoBox.checked ? "1" : "0"); } catch (e) {} });
 
 shot.addEventListener("click", () => fileInput.click());
+$("retake").addEventListener("click", async () => {
+  if (current) { fetch("/discard?" + Q + "&id=" + current, { method: "POST" }).catch(() => {}); current = null; }
+  review.style.display = "none";
+  fileInput.click();
+});
+$("confirm").addEventListener("click", () => confirmCurrent());
+
 fileInput.addEventListener("change", async () => {
   const file = fileInput.files && fileInput.files[0];
   fileInput.value = "";
   if (!file) return;
   msg.textContent = "";
+  review.style.display = "none";
   shot.disabled = true;
-  const item = addItem("正在上传…");
+  shot.textContent = "正在上传…";
   try {
     const blob = await prepare(file);
-    const response = await fetch("/upload?t=" + encodeURIComponent(TOKEN), {
-      method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob,
-    });
-    if (!response.ok) throw new Error("上传失败（" + response.status + "）");
+    const response = await fetch("/prepare?" + Q, { method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob });
+    if (!response.ok) throw new Error(response.status === 503 ? "电脑端已结束扫描" : "上传失败（" + response.status + "）");
     const data = await response.json();
-    uploaded += 1;
-    document.getElementById("counter").textContent = "已上传 " + uploaded + " 张";
-    item.title.textContent = "第 " + uploaded + " 张：识别中…";
-    poll(item, data.id, uploaded);
+    current = data.id;
+    showReview(data);
+    if (autoBox.checked) await confirmCurrent();
   } catch (error) {
-    item.li.className = "error";
-    item.title.textContent = "上传失败";
-    item.meta.textContent = String(error.message || error);
-    msg.textContent = "请确认手机和电脑在同一网络，且电脑上的扫描仍在进行。";
+    msg.textContent = String(error.message || error) + "。请确认手机和电脑在同一网络，且电脑上的扫描仍在进行。";
   } finally {
     shot.disabled = false;
+    shot.textContent = "拍照";
   }
 });
+
+function showReview(data) {
+  const stamp = "&_=" + Date.now();
+  $("outline").src = "/preview?" + Q + "&id=" + data.id + stamp;
+  const verdict = $("verdict");
+  if (data.found) {
+    verdict.className = "ok";
+    verdict.textContent = data.crop ? "已检测到答题卡边框，将按边框裁剪后识别。" : "已检测到答题卡边框（电脑端设置为不裁剪，将使用原图识别）。";
+  } else {
+    verdict.className = "warn";
+    verdict.textContent = "没有检测到完整的边框（需要整张卡入镜、与背景反差明显），将使用原图识别。建议重拍。";
+  }
+  const showCrop = data.found && data.crop;
+  $("cropbox").style.display = showCrop ? "block" : "none";
+  if (showCrop) $("cropped").src = "/crop?" + Q + "&id=" + data.id + stamp;
+  review.style.display = "block";
+  review.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+async function confirmCurrent() {
+  if (!current) return;
+  const id = current;
+  current = null;
+  review.style.display = "none";
+  const item = addItem("正在提交…");
+  try {
+    const response = await fetch("/confirm?" + Q + "&id=" + id, { method: "POST" });
+    if (!response.ok) throw new Error("提交失败（" + response.status + "）");
+    const data = await response.json();
+    confirmed += 1;
+    $("counter").textContent = "已确认 " + confirmed + " 张";
+    item.title.textContent = "第 " + confirmed + " 张：识别中…";
+    poll(item, data.id, confirmed);
+  } catch (error) {
+    item.li.className = "error";
+    item.title.textContent = "提交失败";
+    item.meta.textContent = String(error.message || error);
+  }
+}
 
 function addItem(text) {
   const li = document.createElement("li");
@@ -103,7 +173,7 @@ async function poll(item, id, number) {
     await new Promise((resolve) => setTimeout(resolve, 800));
     let data;
     try {
-      const response = await fetch("/status?t=" + encodeURIComponent(TOKEN) + "&id=" + encodeURIComponent(id));
+      const response = await fetch("/status?" + Q + "&id=" + encodeURIComponent(id));
       data = await response.json();
     } catch (error) { continue; }
     if (data.state !== "done") continue;

@@ -133,13 +133,18 @@ class ScanPage(QWidget):
         root.addWidget(self.folder_box)
 
         self.phone_box = QLabel(
-            "手机和电脑连接同一个 Wi-Fi（或电脑开热点）后点“开始扫描”，用手机扫描出现的二维码，在网页里点“拍照”即可；"
-            "拍一张识别一张，结果也会显示在手机页面上。首次使用时 Windows 防火墙会提示，请选择允许专用网络访问。"
+            "手机和电脑连接同一个 Wi-Fi（或电脑开热点）后点“开始扫描”，用手机扫描出现的二维码，在网页里点“拍照”。"
+            "电脑会自动找出答题卡边框并在手机上显示预览，确认后开始识别，结果同时显示在手机页面上。"
+            "首次使用时 Windows 防火墙会提示，请选择允许专用网络访问。"
         )
         self.phone_box.setWordWrap(True)
         self.phone_box.setObjectName("hint")
         self.phone_box.hide()
         root.addWidget(self.phone_box)
+        self.phone_crop_check = QCheckBox("按检测到的边框裁剪并校正后识别（方案已有“裁剪页面”等预处理时请取消勾选）")
+        self.phone_crop_check.setChecked(True)
+        self.phone_crop_check.hide()
+        root.addWidget(self.phone_crop_check)
 
         control_row = QHBoxLayout()
         self.btn_start = QPushButton("开始扫描")
@@ -218,6 +223,7 @@ class ScanPage(QWidget):
         self.camera_box.setVisible(camera)
         self.folder_box.setVisible(not camera and not phone)
         self.phone_box.setVisible(phone)
+        self.phone_crop_check.setVisible(phone)
         self.preview.setVisible(camera or phone)
         self.status_label.setVisible(camera or phone)
         self.right_tabs.setTabEnabled(0, camera or phone)
@@ -235,6 +241,7 @@ class ScanPage(QWidget):
         self.answer_picker.setEnabled(not running)
         self.radio_camera.setEnabled(not running)
         self.radio_phone.setEnabled(not running)
+        self.phone_crop_check.setEnabled(not running)
         self.radio_folder.setEnabled(not running)
         self.camera_box.setEnabled(not running)
         self.folder_box.setEnabled(not running)
@@ -355,7 +362,10 @@ class ScanPage(QWidget):
             self.show_message(f"正在监控：{self.inbox}。新图片出现后会自动识别。")
 
     def _start_phone(self):
-        self.phone_server = PhoneServer(self.inbox, self)
+        page_w, page_h = self.ctx.project.template["pageDimensions"]
+        self.phone_server = PhoneServer(
+            self.inbox, crop=self.phone_crop_check.isChecked(), aspect=page_w / page_h, parent=self
+        )
         self.phone_server.uploaded.connect(self._on_phone_upload)
         self.phone_server.start()
         urls = self.phone_server.urls()
@@ -366,7 +376,7 @@ class ScanPage(QWidget):
         self.preview.setPixmap(pixmap.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
         others = "；其他地址：" + "  ".join(urls[1:]) if len(urls) > 1 else ""
         self.status_label.setText(f"手机扫码，或在浏览器输入：{urls[0]}{others}")
-        self.show_message("手机扫码后，在网页点“拍照”。拍一张识别一张，结果同时显示在手机页面上。")
+        self.show_message("手机扫码后，在网页点“拍照”；确认边框预览后开始识别，结果同时显示在手机页面上。")
 
     def _on_phone_upload(self, name: str):
         self.captured_count += 1
