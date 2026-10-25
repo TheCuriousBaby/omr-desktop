@@ -1,0 +1,14 @@
+PySide6
+opencv-python-headless
+numpy
+pandas
+matplotlib
+rich
+deepmerge
+dotmap
+jsonschema
+screeninfo
+PyMuPDF
+openpyxl
+pillow
+pyinstaller
