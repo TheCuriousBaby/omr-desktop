@@ -29,7 +29,10 @@ from PySide6.QtWidgets import (
 )
 
 from app.engine_client import EngineJob, write_config
+from app.text_fields_io import field_names, load_texts, save_texts
+from app.ui.answer_picker import AnswerPicker
 from app.ui.context import AppContext
+from app.ui.text_reader import TextReader
 from app.ui.widgets import ImageViewer
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".pdf"}
@@ -113,6 +116,16 @@ class RunPage(QWidget):
         self.records: List[dict] = []
         self.visible_records: List[dict] = []
         self._done = 0
+        self.text_fields: List[str] = []
+        self.texts: Dict[str, Dict[str, str]] = {}
+        self._text_run_dir: Optional[Path] = None
+        self._filling = False
+        self._text_note_shown = False
+        self.reader = TextReader(ctx.settings, self)
+        self.reader.textReady.connect(self._on_text_ready)
+        self.reader.progressChanged.connect(self._on_text_progress)
+        self.reader.failed.connect(lambda text: self.status_label.setText(f"大模型识别文字失败：{text}"))
+        self.job.cropReady.connect(self._on_crop)
         self.setAcceptDrops(True)
         self._build_ui()
         ctx.projectChanged.connect(self.reload)
@@ -141,6 +154,8 @@ class RunPage(QWidget):
         self.file_label.setObjectName("hint")
         left.addWidget(self.file_label)
         top.addLayout(left, 1)
+        self.answer_picker = AnswerPicker(self.ctx)
+        top.addWidget(self.answer_picker)
 
         self.btn_start = QPushButton("开始阅卷")
         self.btn_start.setObjectName("primary")
@@ -195,11 +210,12 @@ class RunPage(QWidget):
 
         splitter = QSplitter(Qt.Horizontal)
         self.table = QTableWidget(0, 0)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.verticalHeader().hide()
         self.table.currentCellChanged.connect(self._on_row_selected)
+        self.table.itemChanged.connect(self._on_cell_edited)
         splitter.addWidget(self.table)
 
         viewer_box = QWidget()
@@ -309,9 +325,22 @@ class RunPage(QWidget):
         files_path.write_text("\n".join(str(p) for p in self.files), "utf-8")
         snapshot = run_meta_dir / "project"
         snapshot.mkdir(exist_ok=True)
-        for name in ("template.json", "evaluation.json"):
-            if (project.dir / name).exists():
-                shutil.copyfile(project.dir / name, snapshot / name)
+        shutil.copyfile(project.dir / "template.json", snapshot / "template.json")
+        chosen_answer = self.answer_picker.selected_path()
+        if chosen_answer:
+            shutil.copyfile(chosen_answer, snapshot / "evaluation.json")
+
+        fields = project.text_fields
+        self.text_fields = [f["name"] for f in fields]
+        self.texts = {}
+        self._text_run_dir = self.run_dir
+        self._text_note_shown = False
+        self.reader.reset()
+        engine_options = dict(self.answer_picker.engine_options())
+        if fields:
+            textfields_path = run_meta_dir / "textfields.json"
+            project.write_text_fields(textfields_path)
+            engine_options["textfields"] = textfields_path
 
         self.statuses = {}
         self._done = 0
@@ -329,6 +358,7 @@ class RunPage(QWidget):
             config=config_path,
             files=files_path,
             output=self.run_dir,
+            **engine_options,
         )
 
     def _set_running(self, running: bool):
@@ -382,6 +412,52 @@ class RunPage(QWidget):
             if result.get("ok") and self.ctx.settings.get("app.open_after_run"):
                 self._open_output()
 
+    # ---------- 文字区域（姓名等）识别 ----------
+
+    def _on_crop(self, info: dict):
+        if not self.reader.available():
+            if not self._text_note_shown:
+                self._text_note_shown = True
+                self.status_label.setText("已定义文字区域，但未在设置中配置大模型，文字没有识别。")
+            return
+        self.reader.enqueue(info["file"], info["field"], info["path"])
+
+    def _on_text_ready(self, file: str, field: str, text: str):
+        self.texts.setdefault(file, {})[field] = text
+        if self._text_run_dir is not None:
+            save_texts(self._text_run_dir, self.text_fields, self.texts)
+        if field not in self.text_fields:
+            return
+        column = 3 + self.text_fields.index(field)
+        for row, record in enumerate(self.visible_records):
+            if record["file"] == file and self.table.columnCount() > column:
+                self._filling = True
+                item = self.table.item(row, column)
+                if item is None:
+                    item = QTableWidgetItem()
+                    self.table.setItem(row, column, item)
+                item.setText(text)
+                self._filling = False
+                break
+
+    def _on_text_progress(self, done: int, total: int):
+        if total and not self.job.running():
+            self.status_label.setText(
+                "文字识别完成" if done >= total else f"正在识别文字 {done}/{total}…"
+            )
+
+    def _on_cell_edited(self, item):
+        if self._filling or not self.text_fields:
+            return
+        column = item.column() - 3
+        row = item.row()
+        if not (0 <= column < len(self.text_fields) and 0 <= row < len(self.visible_records)):
+            return
+        file = self.visible_records[row]["file"]
+        self.texts.setdefault(file, {})[self.text_fields[column]] = item.text().strip()
+        if self.run_dir is not None:
+            save_texts(self.run_dir, self.text_fields, self.texts)
+
     # ---------- 结果展示 ----------
 
     def _refresh_history(self):
@@ -412,6 +488,12 @@ class RunPage(QWidget):
     def _load_run(self, run_dir: Path):
         self.run_dir = run_dir
         columns, records = read_run_results(run_dir)
+        self.text_fields = field_names(run_dir)
+        loaded = load_texts(run_dir)
+        if run_dir == self._text_run_dir:
+            for file, values in self.texts.items():
+                loaded.setdefault(file, {}).update(values)
+        self.texts = loaded
         self._show_records(columns, records)
 
     def _show_records(self, columns: List[str], records: List[dict]):
@@ -429,18 +511,28 @@ class RunPage(QWidget):
                 continue
             rows.append(record)
         self.visible_records = rows
-        headers = ["文件", "状态", "得分"] + self.columns
+        headers = ["文件", "状态", "得分"] + self.text_fields + self.columns
+        text_start, text_end = 3, 3 + len(self.text_fields)
+        self._filling = True
         self.table.setColumnCount(len(headers))
         self.table.setHorizontalHeaderLabels(headers)
         self.table.setRowCount(len(rows))
         for r, record in enumerate(rows):
-            values = [record["file"], STATUS_TEXT.get(record["status"], record["status"]), record["score"]] + record["answers"]
+            file_texts = self.texts.get(record["file"], {})
+            values = (
+                [record["file"], STATUS_TEXT.get(record["status"], record["status"]), record["score"]]
+                + [file_texts.get(name, "") for name in self.text_fields]
+                + record["answers"]
+            )
             for c, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 color = STATUS_COLOR.get(record["status"])
                 if color:
                     item.setBackground(QBrush(color))
+                if not text_start <= c < text_end:
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 self.table.setItem(r, c, item)
+        self._filling = False
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(False)
 
@@ -493,9 +585,11 @@ class RunPage(QWidget):
         )
         if not path:
             return
-        headers = ["文件", "状态", "得分"] + self.columns
+        headers = ["文件", "状态", "得分"] + self.text_fields + self.columns
         rows = [
-            [r["file"], STATUS_TEXT.get(r["status"], r["status"]), r["score"]] + r["answers"]
+            [r["file"], STATUS_TEXT.get(r["status"], r["status"]), r["score"]]
+            + [self.texts.get(r["file"], {}).get(name, "") for name in self.text_fields]
+            + r["answers"]
             for r in self.records
         ]
         try:

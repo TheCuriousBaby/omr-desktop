@@ -413,32 +413,110 @@ class Project:
         value = self.meta.get("processing")
         return (value[0], value[1]) if value else None
 
+    ANSWERS_DIR = "answers"
+    DEFAULT_ANSWER = "默认"
+
+    @property
+    def answers_dir(self) -> Path:
+        return self.dir / self.ANSWERS_DIR
+
+    def answer_names(self) -> List[str]:
+        """方案内全部答案的名称（按名称排序）。"""
+        if not self.answers_dir.exists():
+            return []
+        return sorted(p.stem for p in self.answers_dir.glob("*.json"))
+
+    @property
+    def active_answer(self) -> str:
+        return self.meta.get("answer") or self.DEFAULT_ANSWER
+
+    def answer_path(self, name: str) -> Path:
+        return self.answers_dir / f"{name}.json"
+
+    def _read_answer(self, name: str) -> Optional[dict]:
+        path = self.answer_path(name)
+        if not path.exists():
+            return None
+        data = json.loads(path.read_text("utf-8"))
+        return data if isinstance(data, dict) and data else None
+
+    @property
+    def text_fields(self) -> List[dict]:
+        """文字区域（姓名、班级等）：每项含 name、x、y、w、h，坐标与模板一致。"""
+        return self.meta.setdefault("text_fields", [])
+
+    def write_text_fields(self, path):
+        dump_json(path, self.text_fields)
+
     def load(self):
         template_path = self.dir / self.TEMPLATE
         if template_path.exists():
             self.template = json.loads(template_path.read_text("utf-8"))
-        evaluation_path = self.dir / self.EVALUATION
-        self.evaluation = (
-            json.loads(evaluation_path.read_text("utf-8"))
-            if evaluation_path.exists()
-            else None
-        )
         meta_path = self.dir / self.META
         if meta_path.exists():
             self.meta = json.loads(meta_path.read_text("utf-8"))
+        legacy_path = self.dir / self.EVALUATION
+        names = self.answer_names()
+        if names:
+            if self.meta.get("answer") not in names:
+                self.meta["answer"] = names[0]
+            self.evaluation = self._read_answer(self.active_answer)
+        elif legacy_path.exists():
+            self.evaluation = json.loads(legacy_path.read_text("utf-8"))
+            self.meta["answer"] = self.DEFAULT_ANSWER
+        else:
+            self.evaluation = None
         return self
 
     def save(self):
         self.dir.mkdir(parents=True, exist_ok=True)
         dump_json(self.dir / self.TEMPLATE, self.template)
-        evaluation_path = self.dir / self.EVALUATION
+        self.meta["answer"] = self.active_answer
+        self.answers_dir.mkdir(exist_ok=True)
+        dump_json(self.answer_path(self.active_answer), self.evaluation or {})
+        legacy_path = self.dir / self.EVALUATION
         if self.evaluation:
-            dump_json(evaluation_path, self.evaluation)
-        elif evaluation_path.exists():
-            evaluation_path.unlink()
+            dump_json(legacy_path, self.evaluation)
+        elif legacy_path.exists():
+            legacy_path.unlink()
         (self.dir / self.META).write_text(
             json.dumps(self.meta, ensure_ascii=False, indent=2), "utf-8"
         )
+
+    def switch_answer(self, name: str):
+        """保存当前答案后切换到另一套答案。"""
+        self.save()
+        self.meta["answer"] = name
+        self.evaluation = self._read_answer(name)
+        self.save()
+
+    def new_answer(self, name: str, copy_current: bool = False):
+        """新建一套答案并切换过去；copy_current 为真时以当前答案为底稿。"""
+        if self.answer_path(name).exists():
+            raise FileExistsError(f"答案已存在：{name}")
+        self.save()
+        content = json.loads(json.dumps(self.evaluation)) if (copy_current and self.evaluation) else None
+        self.meta["answer"] = name
+        self.evaluation = content
+        self.save()
+
+    def rename_answer(self, name: str):
+        old = self.active_answer
+        if name == old:
+            return
+        if self.answer_path(name).exists():
+            raise FileExistsError(f"答案已存在：{name}")
+        self.save()
+        self.answer_path(old).rename(self.answer_path(name))
+        self.meta["answer"] = name
+
+    def delete_answer(self):
+        """删除当前答案；删完后切到剩下的第一套，没有则新建空的默认答案。"""
+        self.answer_path(self.active_answer).unlink(missing_ok=True)
+        names = self.answer_names()
+        self.meta["answer"] = names[0] if names else self.DEFAULT_ANSWER
+        self.evaluation = self._read_answer(self.meta["answer"])
+        self.save()
 
     def set_reference(self, source):
         """将空白答题卡复制进方案目录并记录。"""

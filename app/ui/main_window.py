@@ -23,6 +23,7 @@ from app.project import Project, create_project, delete_project, duplicate_proje
 from app.ui.answer_page import AnswerPage
 from app.ui.context import AppContext
 from app.ui.run_page import RunPage
+from app.ui.scan_page import ScanPage
 from app.ui.settings_page import SettingsPage
 from app.ui.template_page import TemplatePage
 
@@ -73,10 +74,12 @@ class MainWindow(QMainWindow):
         self.template_page = TemplatePage(self.ctx)
         self.answer_page = AnswerPage(self.ctx)
         self.run_page = RunPage(self.ctx, self.prepare_run)
+        self.scan_page = ScanPage(self.ctx, self.prepare_run)
         self.settings_page = SettingsPage(self.ctx)
         pages = [
             ("版面模板", self.template_page),
             ("答案评分", self.answer_page),
+            ("扫描采集", self.scan_page),
             ("开始阅卷", self.run_page),
             ("设置", self.settings_page),
         ]
@@ -297,5 +300,6 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.ctx.project.dir)))
 
     def closeEvent(self, event: QCloseEvent):
+        self.scan_page.shutdown()
         self._save_project()
         super().closeEvent(event)

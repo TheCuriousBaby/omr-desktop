@@ -1,8 +1,11 @@
-"""OMRChecker 引擎的子进程入口：提供 run（批量阅卷）、preview（预处理预览）、check（模板校验）三个命令。
+"""OMRChecker 引擎的子进程入口：提供 run（批量阅卷）、watch（监控目录）、preview（预处理预览）、detect（自动识别版面）、check（模板校验）命令。
 
 进程标准输出中以 @@ 开头的行为结构化事件，其余为引擎日志：
   @@FILE\t<文件名>             开始处理一张图片
   @@DONE\t<文件名>\t<状态>      状态为 ok / multi / error
+  @@CROP\t<json>               文字区域裁出的小图，含 file、field、path
+  @@READY\t<json>              watch 已就绪，附输出列名
+  @@ROW\t<json>                watch 模式下每张图的识别结果
   @@RESULT\t<json>             命令的最终结果
 """
 import argparse
@@ -82,7 +85,7 @@ def _patch_engine():
     root.handlers = [handler]
 
 
-def _patch_progress(entry):
+def _patch_progress(entry, after=None):
     original = entry._process_single_image
 
     def wrapped(file_path, img_name, *args, **kwargs):
@@ -91,6 +94,8 @@ def _patch_progress(entry):
         try:
             ret = original(file_path, img_name, *args, **kwargs)
             status = "error" if ret is None else ("multi" if ret else "ok")
+            if after:
+                after(img_name)
             return ret
         finally:
             print(f"@@DONE\t{img_name}\t{status}", flush=True)
@@ -98,39 +103,186 @@ def _patch_progress(entry):
     entry._process_single_image = wrapped
 
 
-def cmd_run(args):
-    from src import entry
+def _install_crop_hook(template, args):
+    """方案定义了文字区域时，记录每张图预处理后的页面，并在识别后把各区域裁成小图保存；返回识别后调用的函数。"""
+    if not getattr(args, "textfields", None):
+        return None
+    fields = json.loads(Path(args.textfields).read_text("utf-8"))
+    if not fields:
+        return None
+    import cv2
+
+    from src.utils.image import ImageUtils
+
+    operations = template.image_instance_ops
+    original = operations.apply_preprocessors
+    holder = {}
+
+    def recording(file_path, in_omr, tpl):
+        page = original(file_path, in_omr, tpl)
+        holder["page"] = page
+        return page
+
+    operations.apply_preprocessors = recording
+    page_w, page_h = template.page_dimensions
+    folder = Path(args.output) / "TextFields"
+    folder.mkdir(parents=True, exist_ok=True)
+
+    def emit(img_name):
+        page = holder.pop("page", None)
+        if page is None:
+            return
+        page = ImageUtils.resize_util(page, page_w, page_h)
+        for field in fields:
+            x, y = max(int(field["x"]), 0), max(int(field["y"]), 0)
+            crop = page[y : y + int(field["h"]), x : x + int(field["w"])]
+            if crop.size == 0:
+                continue
+            if crop.shape[1] < 300:
+                crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+            path = folder / f"{Path(img_name).stem}__{field['name']}.png"
+            cv2.imwrite(str(path), crop)
+            payload = {"file": img_name, "field": field["name"], "path": str(path)}
+            print("@@CROP\t" + json.dumps(payload, ensure_ascii=False), flush=True)
+
+    return emit
+
+
+def _build_run(args):
+    """加载模板、评分文件并建立输出目录，返回 (template, tuning_config, evaluation_config, outputs_namespace)。"""
     from src.evaluation import EvaluationConfig
     from src.template import Template
     from src.utils.file import Paths, setup_dirs_for_paths, setup_outputs_for_template
     from src.utils.parsing import open_config_with_defaults
 
     project_dir = Path(args.project)
-    config_path = Path(args.config)
-    tuning_config = open_config_with_defaults(config_path)
+    tuning_config = open_config_with_defaults(Path(args.config))
     template = Template(project_dir / "template.json", tuning_config)
 
     evaluation_config = None
-    evaluation_path = project_dir / "evaluation.json"
-    if evaluation_path.exists() and not args.noeval:
+    evaluation_path = Path(args.evaluation) if args.evaluation else project_dir / "evaluation.json"
+    if evaluation_path.exists() and not args.noeval and json.loads(evaluation_path.read_text("utf-8")):
         evaluation_config = EvaluationConfig(
             project_dir, evaluation_path, template, tuning_config
         )
 
+    paths = Paths(Path(args.output))
+    setup_dirs_for_paths(paths)
+    outputs_namespace = setup_outputs_for_template(paths, template)
+    return template, tuning_config, evaluation_config, outputs_namespace
+
+
+def cmd_run(args):
+    from src import entry
+
+    template, tuning_config, evaluation_config, outputs_namespace = _build_run(args)
     files = [
         Path(line.strip())
         for line in Path(args.files).read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-
-    paths = Paths(Path(args.output))
-    setup_dirs_for_paths(paths)
-    outputs_namespace = setup_outputs_for_template(paths, template)
-
-    _patch_progress(entry)
+    _patch_progress(entry, _install_crop_hook(template, args))
     entry.process_files(
         files, template, tuning_config, evaluation_config, outputs_namespace
     )
+    _emit_result({"ok": True})
+
+
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".pdf"}
+WATCH_POLL_SECONDS = 0.4
+
+
+def _read_rows(outputs_namespace):
+    """读取结果、多涂、失败三张表，返回 [(状态, 行字典)]；行字典含 file、score、input、answers。"""
+    import csv
+
+    rows = []
+    for key, forced in (("Results", None), ("MultiMarked", "multi"), ("Errors", "error")):
+        path = outputs_namespace.files_obj.get(key)
+        if not path or not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8", newline="") as handle:
+            reader = csv.reader(handle)
+            next(reader, None)
+            for line in reader:
+                if len(line) >= 4:
+                    rows.append(
+                        (
+                            forced,
+                            {"file": line[0], "input": line[1], "score": line[3], "answers": line[4:]},
+                        )
+                    )
+    return rows
+
+
+def _file_is_stable(path):
+    """文件大小在短时间内不再变化，说明已写完。"""
+    import time
+
+    try:
+        first = path.stat().st_size
+        time.sleep(0.25)
+        return first > 0 and first == path.stat().st_size
+    except OSError:
+        return False
+
+
+def cmd_watch(args):
+    """常驻监控目录：新出现的图片立即识别，逐张回传结果；输出目录下 _run/stop 文件出现时退出。"""
+    import time
+
+    from src import entry
+
+    template, tuning_config, evaluation_config, outputs_namespace = _build_run(args)
+    statuses = {}
+    original = entry._process_single_image
+    emit_crops = _install_crop_hook(template, args)
+
+    def tracking(file_path, img_name, *a, **k):
+        print(f"@@FILE\t{img_name}", flush=True)
+        status = "error"
+        try:
+            ret = original(file_path, img_name, *a, **k)
+            if emit_crops:
+                emit_crops(img_name)
+            status = "error" if ret is None else ("multi" if ret else "ok")
+            return ret
+        finally:
+            statuses[img_name] = status
+            print(f"@@DONE\t{img_name}\t{status}", flush=True)
+
+    entry._process_single_image = tracking
+
+    folder = Path(args.folder)
+    stop_file = Path(args.output) / "_run" / "stop"
+    seen, emitted = set(), set()
+    print("@@READY\t" + json.dumps(list(template.output_columns), ensure_ascii=False), flush=True)
+    while not stop_file.exists():
+        pending = sorted(
+            (p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_SUFFIXES and p not in seen),
+            key=lambda p: p.stat().st_mtime,
+        )
+        for path in pending:
+            if not _file_is_stable(path):
+                continue
+            seen.add(path)
+            try:
+                entry.process_files([path], template, tuning_config, evaluation_config, outputs_namespace)
+            except Exception:
+                traceback.print_exc()
+                statuses[path.name] = "error"
+                print(f"@@DONE\t{path.name}\terror", flush=True)
+            for forced, row in _read_rows(outputs_namespace):
+                if row["file"] in emitted:
+                    continue
+                emitted.add(row["file"])
+                row["status"] = forced or statuses.get(row["file"], "ok")
+                print("@@ROW\t" + json.dumps(row, ensure_ascii=False), flush=True)
+            if path.name in statuses and path.name not in emitted and statuses[path.name] == "error":
+                emitted.add(path.name)
+                row = {"file": path.name, "input": str(path), "score": "", "answers": [], "status": "error"}
+                print("@@ROW\t" + json.dumps(row, ensure_ascii=False), flush=True)
+        time.sleep(WATCH_POLL_SECONDS)
     _emit_result({"ok": True})
 
 
@@ -217,7 +369,7 @@ def cmd_check(args):
     )
 
 
-COMMANDS = {"run": cmd_run, "preview": cmd_preview, "detect": cmd_detect, "check": cmd_check}
+COMMANDS = {"run": cmd_run, "watch": cmd_watch, "preview": cmd_preview, "detect": cmd_detect, "check": cmd_check}
 
 
 def main(argv=None):
@@ -230,6 +382,9 @@ def main(argv=None):
     parser.add_argument("--image")
     parser.add_argument("--out")
     parser.add_argument("--noeval")
+    parser.add_argument("--evaluation")
+    parser.add_argument("--textfields")
+    parser.add_argument("--folder")
     args = parser.parse_args(argv)
 
     _prepare_env()

@@ -17,6 +17,9 @@ class EngineJob(QObject):
     logLine = Signal(str)
     fileStarted = Signal(str)
     fileDone = Signal(str, str)
+    ready = Signal(list)
+    rowReady = Signal(dict)
+    cropReady = Signal(dict)
     finished = Signal(dict)
 
     def __init__(self, parent=None):
@@ -69,6 +72,18 @@ class EngineJob(QObject):
         elif line.startswith("@@DONE\t"):
             _, name, status = line.split("\t")
             self.fileDone.emit(name, status)
+        elif line.startswith("@@CROP\t"):
+            try:
+                self.cropReady.emit(json.loads(line.split("\t", 1)[1]))
+            except ValueError:
+                pass
+        elif line.startswith("@@READY\t"):
+            self.ready.emit(json.loads(line.split("\t", 1)[1]))
+        elif line.startswith("@@ROW\t"):
+            try:
+                self.rowReady.emit(json.loads(line.split("\t", 1)[1]))
+            except ValueError:
+                pass
         elif line.startswith("@@RESULT\t"):
             try:
                 self._result = json.loads(line.split("\t", 1)[1])

@@ -246,3 +246,20 @@ def parse_scoring_rules(settings, text: str, count: int) -> dict:
     if "default" not in reply and not reply.get("rules"):
         raise AiError("模型没有解析出评分规则")
     return reply
+
+
+TEXT_PROMPT = """图片是答题卡上的“{field}”栏，内容可能是手写，也可能是印刷。请只输出识别出的文字本身：
+- 不要解释，不要加引号、标点或前后缀。
+- 看不清或栏内为空时，输出空字符串。
+{hint}"""
+
+NAME_HINT = "- 这是人名，通常为 2 到 4 个汉字（也可能是英文名）；不要输出“姓名”两个字本身。"
+
+
+def read_text(settings, image: bytes, field: str) -> str:
+    """让大模型读出一张小图里的文字（姓名、班级等）。"""
+    hint = NAME_HINT if ("姓名" in field or "name" in field.lower()) else ""
+    prompt = TEXT_PROMPT.format(field=field, hint=hint)
+    reply = call_model(settings, image_message(prompt, [image]))
+    text = reply.strip().splitlines()[0].strip() if reply.strip() else ""
+    return text.strip("\"'“”‘’「」 ")[:40]

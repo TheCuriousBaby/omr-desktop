@@ -28,6 +28,7 @@ BLOCK_COLORS = [
 MODE_SELECT = "select"
 MODE_DRAW_BLOCK = "draw_block"
 MODE_MEASURE_BUBBLE = "measure_bubble"
+MODE_DRAW_TEXT = "draw_text"
 
 _HANDLES = ["tl", "t", "tr", "r", "br", "b", "bl", "l"]
 
@@ -180,6 +181,7 @@ class SheetCanvas(QGraphicsView):
     blockGeometryChanged = Signal(int)
     rectDrawn = Signal(QRectF)
     bubbleMeasured = Signal(QRectF)
+    textRectDrawn = Signal(QRectF)
     cursorMoved = Signal(int, int)
     nudged = Signal(int, int)
     deletePressed = Signal()
@@ -197,6 +199,7 @@ class SheetCanvas(QGraphicsView):
         self._pixmap_item: Optional[QGraphicsPixmapItem] = None
         self._pixmap: Optional[QPixmap] = None
         self._items: List[BlockItem] = []
+        self._text_items: list = []
         self._mode = MODE_SELECT
         self._rubber: Optional[QGraphicsRectItem] = None
         self._rubber_start = QPointF()
@@ -237,6 +240,26 @@ class SheetCanvas(QGraphicsView):
 
     def has_image(self) -> bool:
         return self._pixmap_item is not None
+
+    def set_text_regions(self, regions: list):
+        """显示文字区域（姓名、班级等）：橙色虚线框加名称。"""
+        for item in self._text_items:
+            self._scene.removeItem(item)
+        self._text_items = []
+        pen = QPen(QColor("#e8590c"), 2)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.DashLine)
+        for region in regions:
+            box = QGraphicsRectItem(QRectF(region["x"], region["y"], region["w"], region["h"]))
+            box.setPen(pen)
+            box.setBrush(QBrush(QColor(232, 89, 12, 28)))
+            box.setZValue(3)
+            self._scene.addItem(box)
+            label = self._scene.addSimpleText(str(region["name"]))
+            label.setBrush(QBrush(QColor("#e8590c")))
+            label.setPos(region["x"], region["y"] - label.boundingRect().height())
+            label.setZValue(3)
+            self._text_items += [box, label]
 
     def set_blocks(self, blocks: List[Block], selected: int = -1):
         for item in self._items:
@@ -347,6 +370,8 @@ class SheetCanvas(QGraphicsView):
             if rect.width() >= 3 and rect.height() >= 3:
                 if self._mode == MODE_DRAW_BLOCK:
                     self.rectDrawn.emit(rect)
+                elif self._mode == MODE_DRAW_TEXT:
+                    self.textRectDrawn.emit(rect)
                 elif self._mode == MODE_MEASURE_BUBBLE:
                     self.bubbleMeasured.emit(rect)
             event.accept()

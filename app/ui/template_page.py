@@ -51,6 +51,7 @@ from app.ui.widgets import Worker
 from app.ui.canvas import (
     BLOCK_COLORS,
     MODE_DRAW_BLOCK,
+    MODE_DRAW_TEXT,
     MODE_MEASURE_BUBBLE,
     MODE_SELECT,
     SheetCanvas,
@@ -147,6 +148,7 @@ class TemplatePage(QWidget):
         self.canvas.blockGeometryChanged.connect(self._on_canvas_geometry)
         self.canvas.rectDrawn.connect(self._on_rect_drawn)
         self.canvas.bubbleMeasured.connect(self._on_bubble_measured)
+        self.canvas.textRectDrawn.connect(self._on_text_rect_drawn)
         self.canvas.nudged.connect(self._on_nudged)
         self.canvas.deletePressed.connect(self.delete_block)
         self.canvas.cursorMoved.connect(
@@ -162,6 +164,7 @@ class TemplatePage(QWidget):
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_block_tab(), "字段块")
         self.tabs.addTab(self._build_page_tab(), "页面与预处理")
+        self.tabs.addTab(self._build_text_tab(), "文字区域")
         self.tabs.addTab(self._build_check_tab(), "校验")
         self.tabs.setMinimumWidth(470)
         splitter.addWidget(self.tabs)
@@ -191,6 +194,7 @@ class TemplatePage(QWidget):
             (MODE_SELECT, "选择 / 移动"),
             (MODE_DRAW_BLOCK, "框选字段块"),
             (MODE_MEASURE_BUBBLE, "量取气泡大小"),
+            (MODE_DRAW_TEXT, "框选文字区（姓名）"),
         ]:
             button = QToolButton()
             button.setText(text)
@@ -431,6 +435,85 @@ class TemplatePage(QWidget):
         layout.addStretch(1)
         return tab
 
+    def _build_text_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        info = QLabel(
+            "文字区域用于读取答题卡上手写或印刷的文字，如姓名、班级。阅卷时程序把这些区域裁成小图交给大模型识别，"
+            "结果显示在结果表中，可以双击修改。需要先在“设置 → 大模型辅助”配置接口。"
+        )
+        info.setWordWrap(True)
+        info.setObjectName("hint")
+        layout.addWidget(info)
+        self.text_table = QTableWidget(0, 5)
+        self.text_table.setHorizontalHeaderLabels(["名称", "X", "Y", "宽", "高"])
+        self.text_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.text_table.itemChanged.connect(self._on_text_edited)
+        layout.addWidget(self.text_table, 1)
+        row = QHBoxLayout()
+        btn_draw = QPushButton("在图上框选…")
+        btn_draw.clicked.connect(lambda: self.set_mode(MODE_DRAW_TEXT))
+        btn_remove = QPushButton("删除选中")
+        btn_remove.clicked.connect(self._remove_text_region)
+        row.addWidget(btn_draw)
+        row.addWidget(btn_remove)
+        row.addStretch(1)
+        layout.addLayout(row)
+        tip = QLabel("框的范围要包含整个书写区，四周可以略宽；名称会作为结果表的列名。")
+        tip.setObjectName("hint")
+        tip.setWordWrap(True)
+        layout.addWidget(tip)
+        return tab
+
+    def _reload_text_table(self):
+        was_updating, self._updating = self._updating, True
+        self.text_table.setRowCount(0)
+        for region in self.project.text_fields:
+            row = self.text_table.rowCount()
+            self.text_table.insertRow(row)
+            for column, key in enumerate(("name", "x", "y", "w", "h")):
+                self.text_table.setItem(row, column, QTableWidgetItem(str(region[key])))
+        self._updating = was_updating
+        self.canvas.set_text_regions(self.project.text_fields)
+
+    def _on_text_rect_drawn(self, rect: QRectF):
+        fields = self.project.text_fields
+        names = {f["name"] for f in fields}
+        name = "姓名" if "姓名" not in names else self._unique_name("文字区")
+        fields.append(
+            {"name": name, "x": int(rect.x()), "y": int(rect.y()), "w": int(rect.width()), "h": int(rect.height())}
+        )
+        self._reload_text_table()
+        self.tabs.setCurrentIndex(2)
+        self.set_mode(MODE_SELECT)
+        self.changed.emit()
+
+    def _on_text_edited(self, _item=None):
+        if self._updating or not self.project:
+            return
+        fields, names = [], set()
+        for row in range(self.text_table.rowCount()):
+            cells = [self.text_table.item(row, c) for c in range(5)]
+            name = cells[0].text().strip() if cells[0] else ""
+            try:
+                x, y, w, h = (int(float(cells[c].text())) for c in range(1, 5))
+            except (ValueError, AttributeError):
+                continue
+            if not name or name in names or w <= 0 or h <= 0:
+                continue
+            names.add(name)
+            fields.append({"name": name, "x": max(x, 0), "y": max(y, 0), "w": w, "h": h})
+        self.project.meta["text_fields"] = fields
+        self.canvas.set_text_regions(fields)
+        self.changed.emit()
+
+    def _remove_text_region(self):
+        row = self.text_table.currentRow()
+        if row < 0:
+            return
+        self.text_table.removeRow(row)
+        self._on_text_edited()
+
     def _build_check_tab(self):
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -485,6 +568,7 @@ class TemplatePage(QWidget):
             self.canvas.set_image(None, width, height)
             self._reload_pre_list()
             self._reload_custom_table()
+            self._reload_text_table()
         self._updating = False
         self._refresh_block_list()
         self._show_empty_hint()

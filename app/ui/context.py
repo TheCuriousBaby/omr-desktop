@@ -10,6 +10,7 @@ from app.settings import AppSettings
 class AppContext(QObject):
     projectChanged = Signal()
     settingsChanged = Signal()
+    answersChanged = Signal()
 
     def __init__(self, settings: AppSettings):
         super().__init__()

@@ -1,4 +1,5 @@
 """答案与评分页：录入标准答案和分值（可从答案卡、答案图导入，或用自然语言描述评分规则），生成 evaluation.json。"""
+import re
 import shutil
 from pathlib import Path
 from typing import Dict, List
@@ -6,7 +7,9 @@ from typing import Dict, List
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, Qt, Signal
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileDialog,
+    QInputDialog,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -37,6 +40,7 @@ from app.ui.context import AppContext
 from app.ui.run_page import read_run_results
 from app.ui.widgets import Worker
 
+INVALID_NAME = re.compile(r'[\\/:*?"<>|]')
 IMAGE_FILTER = "图片或 PDF (*.jpg *.jpeg *.png *.pdf);;所有文件 (*.*)"
 MAX_SIDE = 1600
 MAX_PDF_PAGES = 4
@@ -92,6 +96,27 @@ class AnswerPage(QWidget):
     def _build_ui(self):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 16)
+
+        set_row = QHBoxLayout()
+        set_row.addWidget(QLabel("当前答案"))
+        self.answer_combo = QComboBox()
+        self.answer_combo.setMinimumWidth(200)
+        self.answer_combo.activated.connect(self._on_answer_chosen)
+        set_row.addWidget(self.answer_combo)
+        for text, callback in [
+            ("新建", self._on_answer_new),
+            ("复制", self._on_answer_copy),
+            ("重命名", self._on_answer_rename),
+            ("删除", self._on_answer_delete),
+        ]:
+            button = QPushButton(text)
+            button.clicked.connect(callback)
+            set_row.addWidget(button)
+        hint = QLabel("同一个版面可以保存多套答案（如不同场次），阅卷和扫描时再选用。")
+        hint.setObjectName("hint")
+        set_row.addWidget(hint)
+        set_row.addStretch(1)
+        layout.addLayout(set_row)
 
         self.banner = QLabel("")
         self.banner.setWordWrap(True)
@@ -235,7 +260,91 @@ class AnswerPage(QWidget):
             except (ValueError, KeyError) as error:
                 self._unsupported = str(error)
         self._update_banner()
+        self._refresh_answer_combo()
         self.refresh()
+
+    def _refresh_answer_combo(self):
+        self._updating = True
+        self.answer_combo.clear()
+        project = self.project
+        if project:
+            names = project.answer_names() or [project.active_answer]
+            for name in names:
+                self.answer_combo.addItem(name, name)
+            index = self.answer_combo.findData(project.active_answer)
+            self.answer_combo.setCurrentIndex(max(index, 0))
+        self._updating = False
+
+    def _switch_after_change(self):
+        """答案集合变动后重新载入页面，并通知其他页面刷新选择。"""
+        self.reload()
+        self.changed.emit()
+        self.ctx.answersChanged.emit()
+
+    def _on_answer_chosen(self, index):
+        if self._updating or not self.project:
+            return
+        name = self.answer_combo.itemData(index)
+        if name == self.project.active_answer:
+            return
+        self.commit()
+        self.project.switch_answer(name)
+        self._switch_after_change()
+
+    def _ask_answer_name(self, title, default=""):
+        name, ok = QInputDialog.getText(self, title, "答案名称", text=default)
+        name = name.strip()
+        if not ok or not name:
+            return None
+        if INVALID_NAME.search(name):
+            QMessageBox.warning(self, "名称不合法", "名称不能包含 反斜杠、/ : * ? 双引号 < > | 等字符。")
+            return None
+        return name
+
+    def _on_answer_new(self):
+        self._create_answer("新建答案", copy=False)
+
+    def _on_answer_copy(self):
+        self._create_answer("复制当前答案", copy=True)
+
+    def _create_answer(self, title, copy):
+        if not self.project:
+            return
+        name = self._ask_answer_name(title, f"{self.project.active_answer} 副本" if copy else "")
+        if not name:
+            return
+        self.commit()
+        try:
+            self.project.new_answer(name, copy_current=copy)
+        except FileExistsError as error:
+            QMessageBox.warning(self, title, str(error))
+            return
+        self._switch_after_change()
+
+    def _on_answer_rename(self):
+        if not self.project:
+            return
+        name = self._ask_answer_name("重命名答案", self.project.active_answer)
+        if not name:
+            return
+        self.commit()
+        try:
+            self.project.rename_answer(name)
+        except FileExistsError as error:
+            QMessageBox.warning(self, "重命名答案", str(error))
+            return
+        self._switch_after_change()
+
+    def _on_answer_delete(self):
+        if not self.project:
+            return
+        answer = QMessageBox.question(
+            self, "删除答案", f"确定删除答案“{self.project.active_answer}”吗？此操作不可恢复。"
+        )
+        if answer != QMessageBox.Yes:
+            return
+        self.project.delete_answer()
+        self._switch_after_change()
 
     def _update_banner(self):
         unsupported = bool(self._unsupported)
