@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QRadioButton,
     QSplitter,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -170,21 +171,6 @@ class ScanPage(QWidget):
         root.addWidget(self.message)
 
         splitter = QSplitter(Qt.Horizontal)
-        left = QWidget()
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(0, 0, 0, 0)
-        self.preview = QLabel("点击“开始扫描”后在此显示摄像头画面")
-        self.preview.setAlignment(Qt.AlignCenter)
-        self.preview.setMinimumSize(360, 270)
-        self.preview.setStyleSheet("background:#1f2937;color:#9ca3af;border-radius:6px;")
-        self.status_label = QLabel("")
-        self.status_label.setObjectName("hint")
-        self.status_label.setWordWrap(True)
-        left_layout.addWidget(self.preview, 1)
-        left_layout.addWidget(self.status_label)
-        splitter.addWidget(left)
-
-        right = QSplitter(Qt.Vertical)
         self.table = QTableWidget(0, 0)
         self.table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
@@ -192,14 +178,28 @@ class ScanPage(QWidget):
         self.table.verticalHeader().hide()
         self.table.currentCellChanged.connect(self._on_row_selected)
         self.table.itemChanged.connect(self._on_cell_edited)
-        right.addWidget(self.table)
+        splitter.addWidget(self.table)
+
+        self.right_tabs = QTabWidget()
+        live = QWidget()
+        live_layout = QVBoxLayout(live)
+        live_layout.setContentsMargins(8, 8, 8, 8)
+        self.preview = QLabel("点击“开始扫描”后在此显示摄像头画面")
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMinimumSize(360, 270)
+        self.preview.setStyleSheet("background:#1f2937;color:#9ca3af;border-radius:6px;")
+        self.status_label = QLabel("")
+        self.status_label.setObjectName("hint")
+        self.status_label.setWordWrap(True)
+        live_layout.addWidget(self.preview, 1)
+        live_layout.addWidget(self.status_label)
+        self.right_tabs.addTab(live, "取景 / 二维码")
         self.viewer = ImageViewer()
-        right.addWidget(self.viewer)
-        right.setStretchFactor(0, 3)
-        right.setStretchFactor(1, 2)
-        splitter.addWidget(right)
+        self.right_tabs.addTab(self.viewer, "标注图")
+        splitter.addWidget(self.right_tabs)
         splitter.setStretchFactor(0, 2)
         splitter.setStretchFactor(1, 3)
+        splitter.setSizes([560, 840])
         root.addWidget(splitter, 1)
 
     # ---------- 状态与提示 ----------
@@ -220,6 +220,8 @@ class ScanPage(QWidget):
         self.phone_box.setVisible(phone)
         self.preview.setVisible(camera or phone)
         self.status_label.setVisible(camera or phone)
+        self.right_tabs.setTabEnabled(0, camera or phone)
+        self.right_tabs.setCurrentIndex(0 if (camera or phone) else 1)
         if not self.running:
             self.preview.setPixmap(QPixmap())
             self.preview.setText(
@@ -329,6 +331,8 @@ class ScanPage(QWidget):
         self._update_counter()
         self._set_running(True)
         self.show_message("正在启动识别引擎…")
+        if camera_mode or phone_mode:
+            self.right_tabs.setCurrentIndex(0)
         self.job.start(
             "watch",
             project=project.dir,
@@ -508,6 +512,7 @@ class ScanPage(QWidget):
         row_index = self.table.currentRow()
         if not (0 <= row_index < len(self.rows)) or self.run_dir is None:
             return
+        self.right_tabs.setCurrentIndex(1)
         marked = self.run_dir / "CheckedOMRs" / self.rows[row_index]["file"]
         if marked.exists():
             self.viewer.set_pixmap(QPixmap(str(marked)))
