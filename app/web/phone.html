@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>OMR 拍照上传</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#ffffff; --text:#1f2937; --muted:#667085; --primary:#2f6fed; --ok:#067647; --warn:#b54708; --bad:#b42318; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111827; --card:#1f2937; --text:#f3f4f6; --muted:#9ca3af; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+  header { padding:20px 16px 8px; }
+  h1 { margin:0; font-size:20px; }
+  .sub { color:var(--muted); font-size:13px; margin-top:4px; }
+  .shot { display:block; width:calc(100% - 32px); margin:12px 16px; padding:26px 0; font-size:24px; font-weight:600;
+          background:var(--primary); color:#fff; border:0; border-radius:14px; }
+  .shot:disabled { opacity:.55; }
+  .counter { margin:0 16px 8px; color:var(--muted); font-size:14px; }
+  ul { list-style:none; margin:0; padding:0 16px 40px; }
+  li { background:var(--card); border-radius:12px; padding:12px 14px; margin-bottom:10px; border-left:5px solid var(--muted); }
+  li.done { border-left-color:var(--ok); }
+  li.multi { border-left-color:var(--warn); }
+  li.error { border-left-color:var(--bad); }
+  .title { font-size:16px; font-weight:600; }
+  .meta { color:var(--muted); font-size:13px; margin-top:3px; }
+  #msg { margin:0 16px; color:var(--bad); font-size:14px; min-height:20px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>OMR 拍照上传</h1>
+  <div class="sub">点“拍照”，用手机相机拍下整张答题卡，确认后自动上传并识别。</div>
+</header>
+<button class="shot" id="shot">拍照</button>
+<input id="file" type="file" accept="image/*" capture="environment" hidden>
+<div id="msg"></div>
+<div class="counter" id="counter">已上传 0 张</div>
+<ul id="list"></ul>
+<script>
+const TOKEN = new URLSearchParams(location.search).get("t") || "";
+const MAX_SIDE = 3200;
+const STATUS_TEXT = { ok: "识别完成", multi: "识别完成，有多涂", error: "识别失败" };
+let uploaded = 0;
+const fileInput = document.getElementById("file");
+const shot = document.getElementById("shot");
+const list = document.getElementById("list");
+const msg = document.getElementById("msg");
+
+shot.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", async () => {
+  const file = fileInput.files && fileInput.files[0];
+  fileInput.value = "";
+  if (!file) return;
+  msg.textContent = "";
+  shot.disabled = true;
+  const item = addItem("正在上传…");
+  try {
+    const blob = await prepare(file);
+    const response = await fetch("/upload?t=" + encodeURIComponent(TOKEN), {
+      method: "POST", headers: { "Content-Type": "image/jpeg" }, body: blob,
+    });
+    if (!response.ok) throw new Error("上传失败（" + response.status + "）");
+    const data = await response.json();
+    uploaded += 1;
+    document.getElementById("counter").textContent = "已上传 " + uploaded + " 张";
+    item.title.textContent = "第 " + uploaded + " 张：识别中…";
+    poll(item, data.id, uploaded);
+  } catch (error) {
+    item.li.className = "error";
+    item.title.textContent = "上传失败";
+    item.meta.textContent = String(error.message || error);
+    msg.textContent = "请确认手机和电脑在同一网络，且电脑上的扫描仍在进行。";
+  } finally {
+    shot.disabled = false;
+  }
+});
+
+function addItem(text) {
+  const li = document.createElement("li");
+  const title = document.createElement("div"); title.className = "title"; title.textContent = text;
+  const meta = document.createElement("div"); meta.className = "meta";
+  li.appendChild(title); li.appendChild(meta);
+  list.insertBefore(li, list.firstChild);
+  return { li, title, meta };
+}
+
+async function prepare(file) {
+  try {
+    const bitmap = await createImageBitmap(file, { imageOrientation: "from-image" });
+    const scale = Math.min(1, MAX_SIDE / Math.max(bitmap.width, bitmap.height));
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.round(bitmap.width * scale);
+    canvas.height = Math.round(bitmap.height * scale);
+    canvas.getContext("2d").drawImage(bitmap, 0, 0, canvas.width, canvas.height);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
+    if (blob) return blob;
+  } catch (error) { /* 浏览器不支持时直接上传原图 */ }
+  return file;
+}
+
+async function poll(item, id, number) {
+  for (let i = 0; i < 240; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 800));
+    let data;
+    try {
+      const response = await fetch("/status?t=" + encodeURIComponent(TOKEN) + "&id=" + encodeURIComponent(id));
+      data = await response.json();
+    } catch (error) { continue; }
+    if (data.state !== "done") continue;
+    const row = data.row;
+    item.li.className = row.status === "ok" ? "done" : row.status;
+    const texts = Object.values(row.texts || {}).filter((t) => t).join(" ");
+    item.title.textContent = "第 " + number + " 张：" + (texts || STATUS_TEXT[row.status] || row.status);
+    const parts = [STATUS_TEXT[row.status] || row.status];
+    if (row.score !== "" && row.score !== undefined) parts.push("得分 " + row.score);
+    item.meta.textContent = parts.join("，");
+    return;
+  }
+  item.meta.textContent = "等待识别结果超时，请在电脑上查看。";
+}
+</script>
+</body>
+</html>

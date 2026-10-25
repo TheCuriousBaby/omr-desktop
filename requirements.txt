@@ -12,3 +12,4 @@ PyMuPDF
 openpyxl
 pillow
 pyinstaller
+segno

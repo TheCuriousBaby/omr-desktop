@@ -1,5 +1,6 @@
 """扫描采集页：用摄像头逐张拍照识别，或监控一个目录（手机、扫描仪保存的图片）自动识别。"""
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -25,6 +26,8 @@ from PySide6.QtWidgets import (
 )
 
 from app.engine_client import EngineJob, write_config
+from app.phone_server import PhoneServer
+from app.qr_image import qr_image
 from app.text_fields_io import save_texts
 from app.ui.answer_picker import AnswerPicker
 from app.ui.context import AppContext
@@ -57,6 +60,7 @@ class ScanPage(QWidget):
         self.rows: List[dict] = []
         self.statuses: Dict[str, str] = {}
         self.captured_count = 0
+        self.phone_server: Optional[PhoneServer] = None
         self.text_fields: List[str] = []
         self.texts: Dict[str, Dict[str, str]] = {}
         self._filling = False
@@ -83,11 +87,14 @@ class ScanPage(QWidget):
         source_row = QHBoxLayout()
         self.radio_camera = QRadioButton("摄像头")
         self.radio_folder = QRadioButton("监控文件夹")
+        self.radio_phone = QRadioButton("手机（扫码拍照）")
         self.radio_camera.setChecked(True)
         self.radio_camera.toggled.connect(self._update_mode)
+        self.radio_phone.toggled.connect(self._update_mode)
         source_row.addWidget(QLabel("来源"))
         source_row.addWidget(self.radio_camera)
         source_row.addWidget(self.radio_folder)
+        source_row.addWidget(self.radio_phone)
         source_row.addStretch(1)
         root.addLayout(source_row)
 
@@ -123,6 +130,15 @@ class ScanPage(QWidget):
         folder_row.addWidget(btn_browse)
         self.folder_box.hide()
         root.addWidget(self.folder_box)
+
+        self.phone_box = QLabel(
+            "手机和电脑连接同一个 Wi-Fi（或电脑开热点）后点“开始扫描”，用手机扫描出现的二维码，在网页里点“拍照”即可；"
+            "拍一张识别一张，结果也会显示在手机页面上。首次使用时 Windows 防火墙会提示，请选择允许专用网络访问。"
+        )
+        self.phone_box.setWordWrap(True)
+        self.phone_box.setObjectName("hint")
+        self.phone_box.hide()
+        root.addWidget(self.phone_box)
 
         control_row = QHBoxLayout()
         self.btn_start = QPushButton("开始扫描")
@@ -198,11 +214,17 @@ class ScanPage(QWidget):
         self.message.show()
 
     def _update_mode(self):
-        camera = self.radio_camera.isChecked()
+        camera, phone = self.radio_camera.isChecked(), self.radio_phone.isChecked()
         self.camera_box.setVisible(camera)
-        self.folder_box.setVisible(not camera)
-        self.preview.setVisible(camera)
-        self.status_label.setVisible(camera)
+        self.folder_box.setVisible(not camera and not phone)
+        self.phone_box.setVisible(phone)
+        self.preview.setVisible(camera or phone)
+        self.status_label.setVisible(camera or phone)
+        if not self.running:
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText(
+                "点击“开始扫描”后在此显示二维码" if phone else "点击“开始扫描”后在此显示摄像头画面"
+            )
 
     def _set_running(self, running: bool):
         self.running = running
@@ -210,6 +232,7 @@ class ScanPage(QWidget):
         self.btn_stop.setEnabled(running)
         self.answer_picker.setEnabled(not running)
         self.radio_camera.setEnabled(not running)
+        self.radio_phone.setEnabled(not running)
         self.radio_folder.setEnabled(not running)
         self.camera_box.setEnabled(not running)
         self.folder_box.setEnabled(not running)
@@ -259,10 +282,11 @@ class ScanPage(QWidget):
         if not project or self.running:
             return
         camera_mode = self.radio_camera.isChecked()
+        phone_mode = self.radio_phone.isChecked()
         if camera_mode and self.camera_combo.currentData() is None:
             self.show_message("没有可用的摄像头，请连接后点“刷新摄像头”。", error=True)
             return
-        if not camera_mode and not Path(self.folder_edit.text().strip()).is_dir():
+        if not camera_mode and not phone_mode and not Path(self.folder_edit.text().strip()).is_dir():
             self.show_message("请选择一个有效的监控文件夹。", error=True)
             return
         error = self.prepare()
@@ -284,7 +308,7 @@ class ScanPage(QWidget):
             shutil.copyfile(chosen_answer, snapshot / "evaluation.json")
         config_path = meta_dir / "config.json"
         write_config(config_path, project.engine_config(self.ctx.settings))
-        self.inbox = meta_dir / "inbox" if camera_mode else Path(self.folder_edit.text().strip())
+        self.inbox = meta_dir / "inbox" if (camera_mode or phone_mode) else Path(self.folder_edit.text().strip())
         self.inbox.mkdir(parents=True, exist_ok=True)
 
         fields = project.text_fields
@@ -321,8 +345,46 @@ class ScanPage(QWidget):
         self.table.setHorizontalHeaderLabels(headers)
         if self.radio_camera.isChecked():
             self._start_camera()
+        elif self.radio_phone.isChecked():
+            self._start_phone()
         else:
             self.show_message(f"正在监控：{self.inbox}。新图片出现后会自动识别。")
+
+    def _start_phone(self):
+        self.phone_server = PhoneServer(self.inbox, self)
+        self.phone_server.uploaded.connect(self._on_phone_upload)
+        self.phone_server.start()
+        urls = self.phone_server.urls()
+        if not urls:
+            self.show_message("没有找到可用的局域网地址，请先让电脑连接 Wi-Fi 或网线。", error=True)
+            return
+        pixmap = QPixmap.fromImage(qr_image(urls[0], 7))
+        self.preview.setPixmap(pixmap.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
+        others = "；其他地址：" + "  ".join(urls[1:]) if len(urls) > 1 else ""
+        self.status_label.setText(f"手机扫码，或在浏览器输入：{urls[0]}{others}")
+        self.show_message("手机扫码后，在网页点“拍照”。拍一张识别一张，结果同时显示在手机页面上。")
+
+    def _on_phone_upload(self, name: str):
+        self.captured_count += 1
+        self._update_counter()
+
+    def _publish_result(self, file: str):
+        """把识别结果回显到手机页面；需要读取文字的卡，等文字读完再回显。"""
+        if self.phone_server is None:
+            return
+        row = next((r for r in self.rows if r["file"] == file), None)
+        if row is None:
+            return
+        texts = self.texts.get(file, {})
+        waiting = self.reader.available() and row["status"] != "error" and any(f not in texts for f in self.text_fields)
+        if waiting:
+            return
+        self.phone_server.set_result(file, {"status": row["status"], "score": row["score"], "texts": texts})
+
+    def _stop_phone_server(self):
+        if self.phone_server is not None:
+            self.phone_server.stop()
+            self.phone_server = None
 
     def _start_camera(self):
         from app.camera import CameraWorker
@@ -390,6 +452,7 @@ class ScanPage(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.scrollToBottom()
         self._update_counter()
+        self._publish_result(row["file"])
 
     def _on_crop(self, info: dict):
         if not self.reader.available():
@@ -403,6 +466,7 @@ class ScanPage(QWidget):
         self.texts.setdefault(file, {})[field] = text
         if self.run_dir is not None:
             save_texts(self.run_dir, self.text_fields, self.texts)
+        self._publish_result(file)
         if field not in self.text_fields:
             return
         column = 4 + self.text_fields.index(field)
@@ -433,6 +497,8 @@ class ScanPage(QWidget):
         parts = []
         if self.radio_camera.isChecked():
             parts.append(f"已拍 {self.captured_count} 张")
+        elif self.radio_phone.isChecked():
+            parts.append(f"已上传 {self.captured_count} 张")
         parts.append(f"已识别 {len(self.rows)} 张")
         if abnormal:
             parts.append(f"异常 {abnormal} 张")
@@ -454,6 +520,8 @@ class ScanPage(QWidget):
             return
         self.btn_stop.setEnabled(False)
         self.btn_shot.setEnabled(False)
+        if self.phone_server is not None:
+            self.phone_server.close_uploads()
         if self.camera is not None:
             self.camera.stop()
             self.camera.wait(3000)
@@ -474,6 +542,9 @@ class ScanPage(QWidget):
         if (self._pending_count() > 0 or self.reader.pending() > 0) and self._drain_elapsed < DRAIN_TIMEOUT_SECONDS:
             return
         self._drain_timer.stop()
+        if self.phone_server is not None:
+            time.sleep(1.0)
+            self._stop_phone_server()
         (self.run_dir / "_run" / "stop").write_text("1")
         self._kill_timer.start(KILL_TIMEOUT_SECONDS * 1000)
 
@@ -481,6 +552,7 @@ class ScanPage(QWidget):
         self._kill_timer.stop()
         self._drain_timer.stop()
         was_running = self.running
+        self._stop_phone_server()
         if self.camera is not None:
             self.camera.stop()
             self.camera.wait(3000)
@@ -508,7 +580,8 @@ class ScanPage(QWidget):
             )
 
     def shutdown(self):
-        """程序退出前释放摄像头并结束引擎。"""
+        """程序退出前释放摄像头、关闭手机服务并结束引擎。"""
+        self._stop_phone_server()
         if self.camera is not None:
             self.camera.stop()
             self.camera.wait(2000)
